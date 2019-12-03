@@ -8,6 +8,9 @@ Network game is functional on localhost, run two applications one as server the 
 Learning Outcomes -
 
 How C++ works and makes life easier with pointer believe it or not!
+
 Expanding on basic C++ concepts in less than two weeks
+
 Network Programming in C++ and SFML
+
 Game Design & Development with Simple Format Media Library
