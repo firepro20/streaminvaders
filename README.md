@@ -7,7 +7,7 @@ Network game is functional on localhost, run two applications one as server the 
 
 Learning Outcomes -
 
-How C++ works and makes life easier with pointer believe it or not!
+How C++ works and makes life easier with pointers!
 
 Expanding on basic C++ concepts in less than two weeks
 
