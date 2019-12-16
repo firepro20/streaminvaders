@@ -2,16 +2,17 @@
 #include "enemy.h"
 #include "bullet.h"
 #include "collisionmanager.h"
+#include "win.h"
+#include "lose.h"
 #include <iostream>
+#include <cassert>
 
 #define NUMBER_OF_ALIENS 8
 #define SERVER_PORT 54000 // one port needs to be defined for UDP
-//#define CLIENT_PORT 54001
 
-
-enum State {
-	Win,
-	Lose
+struct PlayerMessage {
+	int time;
+	float x, y;
 };
 
 float direction = 1.f;
@@ -19,11 +20,13 @@ const float playerSpeed = 200.f;
 const float enemySpeed = 100.f;
 const float bulletSpeed = 150.f;
 const sf::Time TimePerFrame = sf::seconds(1.f / 60.f);
+const sf::Time tickRate = sf::seconds(1.f / 30.f); // 30 updates per second
 
 sf::Time				mStatisticsUpdateTime;
 std::size_t				mStatisticsNumFrames;
 
 bool					mPlayerIsAlive;
+bool*					playerAlivePtr;
 bool					mIsMovingUp;
 bool					mIsMovingDown;
 bool					mIsMovingRight;
@@ -31,6 +34,7 @@ bool					mIsMovingLeft;
 bool					mIsShooting;
 bool					mIsServer;
 bool					mIsClient;
+bool					winState;
 bool					gameOver;
 bool					serverCreated;
 
@@ -40,12 +44,19 @@ sf::UdpSocket			socket; // only need one socket, bind this in the beginning both
 sf::IpAddress			server;
 sf::Sprite				mPlayer; //moved this to global to access position on viewer/client
 sf::Sprite*				player;
+sf::Vector2f			firstEnemyPosition;
 Bullet*					bulletPtr;
 int						enemyShotID;
-sf::Vector2f			firstEnemyPosition;
+std::string				enemyStatus;
+sf::Clock				gameTime;
+int						gameTimer;
+int*					gameTimerPtr;
+std::vector<PlayerMessage> messageHolder;
 
+bool					useServerTime = true;
 bool					sendInitialToServer = false;
 bool					portBound = false;
+bool					enemyCheckOnConnected = false;
 
 // Prototypes
 void processEvents(sf::RenderWindow& window);
@@ -63,7 +74,7 @@ void runUdpClient(unsigned short port);
 Game* game = Game::getInstance(); // for window dimensions
 
 std::vector<Enemy>* enemyList = new std::vector<Enemy>();
-bool					enemyStatus[NUMBER_OF_ALIENS];
+
 
 int main()
 {
@@ -73,10 +84,15 @@ int main()
 	sf::Texture				mBackgroundTexture;
 	sf::Sprite				mBackground;
 	
+	Win win;
+	Lose lose;
+
 	enemyShotID = -1; // initialising ID to send to client
 
 	Bullet bullet(0, bulletSpeed);
 	bulletPtr = &bullet;
+	mPlayerIsAlive = true;
+	playerAlivePtr = &mPlayerIsAlive;
 
 	sf::RenderWindow		window(sf::VideoMode(game->getWindowWidth(), game->getWindowHeight()), "Stream Invaders");
 	
@@ -164,9 +180,10 @@ int main()
 	// Measure elapsed time
 	sf::Clock clock; // -> can actually be used as game time? to determine movement possibly
 	sf::Time timeSinceLastUpdate = sf::Time::Zero;
-	// Measure time to reach end of screen
-	sf::Clock gameTime;
-	sf::Time timeToHitEdge;
+
+	sf::Clock tickClock;
+	sf::Time timeSinceLastTick = sf::Time::Zero;
+	
 	char userChoice = NULL;
 
 	// something here or within the window is open needs to happen to select whether to view or play
@@ -185,6 +202,7 @@ int main()
 			} while (userChoice != 's' && userChoice != 'c');
 			// The game clock will keep on restarting until the user makes a decision
 			clock.restart(); // This solved issue to start movements and updates at same time once user chooses an option
+			tickClock.restart();
 			gameTime.restart(); // restarts the main game time
 		}
 		
@@ -207,7 +225,11 @@ int main()
 
 			// Puts the time counter back to zero and also returns the time elapsed since the clock was started
 			sf::Time deltaTime = clock.restart();
-			std::cout << "Game Time - " << gameTime.getElapsedTime().asSeconds() << std::endl;
+			if (useServerTime) {
+				gameTimer = gameTime.getElapsedTime().asMilliseconds();
+			}
+			
+			std::cout << "Game Time - " << gameTimer << std::endl;
 			
 			timeSinceLastUpdate += deltaTime;
 			while (timeSinceLastUpdate > TimePerFrame) // fixed time steps // userchoice != NULL otherwise it will start immeadiately
@@ -297,10 +319,15 @@ int main()
 
 					// This takes care of everything on both sides
 					if ((i->getSprite().getPosition().y > game->getWindowHeight() - mPlayer.getLocalBounds().height)) {
+
+						mPlayerIsAlive = false;
+						winState = false;
+						gameOver = true;
+
 						//removeEnemy(enemy);
 						// ALIVE is false, then draw based on whether alien is alive or not
-						std::cout << "Everyone should be dead game over!" << std::endl;
-						return 0; // change state to paused
+						//std::cout << "Everyone should be dead game over!" << std::endl;
+						//return 0; // change state to paused
 					}
 
 					// Populates position of first spaceship to be sent to client
@@ -319,10 +346,13 @@ int main()
 					
 					// Test player and alien collision
 					if (CollisionManager::collidesWith(mPlayer, *i) && i->isAlive()) { // *i it points to the enemy, and will give me an enemy
-						std::cout << "You're dead!" << std::endl;
-						mPlayerIsAlive = false;
+						//std::cout << "You're dead!" << std::endl;
 						
-						return 0; //-> I'm dead gameOver = true;
+							mPlayerIsAlive = false;
+							winState = false;
+							gameOver = true;
+						
+						//return 0; //-> I'm dead gameOver = true;
 					}
 
 					// Test collision between bullets and aliens
@@ -347,14 +377,23 @@ int main()
 			// ** end of if server
 
 			int deadEnemies = 0;
-			for (std::vector<Enemy>::iterator i = enemyList->begin(); i != enemyList->end(); ++i) {
 			
+			for (std::vector<Enemy>::iterator i = enemyList->begin(); i != enemyList->end(); ++i) {
+				char buff[20];
+				std::size_t found = enemyStatus.find(std::to_string(i->getID()));
 				if (!(i->isAlive())) {
+					if(!(found != std::string::npos)){ // if it's not in the string, add it
+						enemyStatus += std::to_string(i->getID());
+						std::cout << "Enemy Status - " << enemyStatus << std::endl;
+					}
 					deadEnemies++;
 				}
 				if (deadEnemies >= NUMBER_OF_ALIENS) {
-					std::cout << "You win!" << std::endl;
-					
+					//std::cout << "You win!" << std::endl;
+					if (!gameOver) {
+						winState = true;
+						gameOver = true;
+					}
 					// change state to win
 					//return 0; // Set state win
 				}
@@ -403,23 +442,48 @@ int main()
 					//std::cout << "Enemy " << i->getID() << " position - " << i->getLocation().x << " " << i->getLocation().y << std::endl;
 				}
 			}
-
-			
+						
 
 			//test collision with bullet and boundary
 			if (bullet.getSprite().getPosition().y < 0)
 				bullet.kill();
 
-
+			
 			// Network
-			if (userChoice == 's') {
-				createUdpServer(SERVER_PORT);
+			if (userChoice == 's') { // && tick > 50ms
+				
+				sf::Time deltaTick = tickClock.restart();
+				timeSinceLastTick += deltaTick;
+				while (timeSinceLastTick > tickRate) {
+
+					timeSinceLastTick = sf::Time::Zero;
+					createUdpServer(SERVER_PORT);
+
+				}
+				
 			}
 			else {
 				runUdpClient(SERVER_PORT);
 			}
+
+			// State Overlay Sprites
+			if (!gameOver) {
+				window.display();
+			}
+			else {
+				if (winState) {
+					win.getSprite().setOrigin(win.getSprite().getLocalBounds().width / 2.f, win.getSprite().getLocalBounds().height / 2.f);
+					win.setLocation(game->getWindowWidth() / 2.f, game->getWindowHeight() / 2.f);
+					win.draw(window);
+				}
+				if (!mPlayerIsAlive || !playerAlivePtr) {
+					lose.getSprite().setOrigin(lose.getSprite().getLocalBounds().width / 2.f, lose.getSprite().getLocalBounds().height / 2.f);
+					lose.setLocation(game->getWindowWidth() / 2.f, game->getWindowHeight() / 2.f);
+					lose.draw(window);
+				}
+				window.display();
+			}
 			
-			window.display();
 
 		} // end of main second if
 	}
@@ -431,8 +495,8 @@ void createUdpServer(unsigned short port) { // send data to client
 	
 	// Create a socket to receive a message from anyone
 	sf::UdpSocket socket;
-	sf::IpAddress local = sf::IpAddress::getLocalAddress(); // Currently 127.0.0.1 localhost
-	sf::IpAddress receiver = sf::IpAddress::getLocalAddress();
+	//sf::IpAddress local = sf::IpAddress::getLocalAddress(); // Currently 127.0.0.1 localhost
+	//sf::IpAddress receiver = sf::IpAddress::getLocalAddress();
 	
 	socket.setBlocking(false);
 	// I was figuring out and arranging according to example.. set socket non blocking
@@ -474,17 +538,16 @@ void createUdpServer(unsigned short port) { // send data to client
 	float playerYPosition = player->getPosition().y;
 	float enemyXPosition  =	firstEnemyPosition.x;
 	float enemyYPosition  = firstEnemyPosition.y;
+	int timeStamp = gameTime.getElapsedTime().asMilliseconds(); // server time
+	//std::string enemyStatus = "26"; // add dead enemies to a string
 	
+	playerData << timeStamp << playerXPosition << playerYPosition << bulletPtr->isAlive() << enemyShotID << enemyXPosition << enemyYPosition 
+			   << enemyStatus << mPlayerIsAlive;
 	
-	playerData << playerXPosition << playerYPosition << bulletPtr->isAlive() << enemyShotID << enemyXPosition << enemyYPosition;
-	//bulletData << bulletPtr->isAlive() << bulletPtr->getLocation().x << bulletPtr->getLocation().y;
 	socket.send(playerData, sender, port);
-	//socket.send(bulletData, sender, port);
-	//const char out[] = "";
-	//if (socket.send(out, sizeof(out), sender, port) != sf::Socket::Done)
-	//	return;
 	
-	// Reset
+	
+	// Reset enemy shot ID
 	enemyShotID = -1;
 
 }
@@ -493,17 +556,21 @@ void runUdpClient(unsigned short port) { // receive data from server
 
 	// Ask for the server address
 	server = "127.0.0.1";
+	//server = "192.168.0.1";
+	//std::cout << server << std::endl;
 	/*
-	if (server == sf::IpAddress::None)
-	do
-	{
-		std::cout << "Type the address or name of the server to connect to: ";
-		std::cin >> server;
+	if (server == sf::IpAddress::None){
+		do
+		{
+			std::cout << "Type the address or name of the server to connect to: ";
+			std::cin >> server;
 		
-	} while (server != sf::IpAddress::None);
+		} while (server != sf::IpAddress::Any);
+	}
 	*/
 	// Create a socket for communicating with the server
 	sf::UdpSocket socket;
+
 
 	sf::IpAddress recipient = sf::IpAddress::getLocalAddress();
 	char data[100] = "Connection with client established!";
@@ -521,14 +588,14 @@ void runUdpClient(unsigned short port) { // receive data from server
 	sf::SocketSelector selector;
 	selector.add(socket);
 	
-	if (selector.wait(sf::milliseconds(10.f))) { // not enough time for server to be created with 0.1f
+	if (selector.wait(sf::milliseconds(10.f))) { // not enough time for server to be created with 0.1f // previously was 100
 
 		// received something
 		if (selector.isReady(socket)) {
 
 			// Wait for a message
-			char in[128];
-			std::size_t received; // am I using this?
+			//char in[128];
+			//std::size_t received; // am I using this?
 			sf::IpAddress sender;
 			sf::Packet playerData; // playerdata1 //playerdata2
 			sf::Packet bulletData;
@@ -541,25 +608,72 @@ void runUdpClient(unsigned short port) { // receive data from server
 			float yEnemyOffset = 50.f;
 			float xEnemyOffset = 60.f;
 			bool bulletShot;
+			bool playerAlive;
 			int enemyShotIDReceived;
-			
+			std::string enemyStatusReceived;
+			int packetTime;
+			// predicted position coordinates
+			float x_;
+			float y_;
+			float x_one;
+			float y_one;
+			float x_final; // interpolated value
+			float y_final; // interpolated value
+
 			// third packet
 			socket.receive(playerData, sender, port); 
 			// first packet - interpolate .. create scenario as tutorial
-
-			//socket.receive(bulletData, sender, port);
-
-			if (playerData >> playerXPosition >> playerYPosition >> bulletShot >> enemyShotIDReceived >> clientEnemyXPosition >> clientEnemyYPosition) { // if you are able to read
+			
+			if (playerData >> packetTime >> playerXPosition >> playerYPosition >> bulletShot >> enemyShotIDReceived >> clientEnemyXPosition >> clientEnemyYPosition 
+				>> enemyStatusReceived >> playerAlive) { // if you are able to read
 				clientXPosition = playerXPosition;
 				clientYPosition = playerYPosition;
-				//std::cout << "Value of enemy received " << enemyShotIDReceived << std::endl;
-
-				player->setPosition(clientXPosition, clientYPosition);
 				
+				//std::cout << "State of player is - " << playerAlive << std::endl;
+				//std::cout << "Received from server - " << packetTime << std::endl;
+				gameTimer = packetTime;
+				useServerTime = false;
+				//gameTimerPtr = &packetTime;
+
+				//player->setPosition(clientXPosition, clientYPosition);
+				
+				// Handles prediction
+				PlayerMessage msg;
+				msg.time = packetTime;  msg.x = clientXPosition; msg.y = clientYPosition;
+				messageHolder.push_back(msg);
+				int messageHolderSize = messageHolder.size();
+				std::cout << "Message Holder Size - " << messageHolderSize << std::endl;
+				if (messageHolder.size() >= 3) {
+					const PlayerMessage& msg0 = messageHolder[messageHolderSize - 1];
+					const PlayerMessage& msg1 = messageHolder[messageHolderSize - 2];
+					const PlayerMessage& msg2 = messageHolder[messageHolderSize - 3];
+
+					//std::cout << "X " << " " << msg0.x << " " << msg1.x << " " << msg2.x << std::endl;
+					//std::cout << "Y " << " " << msg0.y << " " << msg1.y << " " << msg2.y << std::endl;
+					//std::cout << "Time Stamp " << " " << msg0.time << " " << msg1.time << " " << msg2.time << std::endl;
+
+					/* Linear Model */
+					int latency = gameTimer - msg1.time; // this works as it is the latest, if we do 2, then it's like we missed two updates
+					float velocity_x = (msg0.x - msg1.x) / (msg0.time - msg1.time); // only prediction for third position
+					float velocity_y = (msg0.y - msg1.y) / (msg0.time - msg1.time);
+					x_ = msg0.x + velocity_x * latency;
+					y_ = msg0.y + velocity_y * latency;
+					x_one = msg1.x + velocity_x * latency;
+					y_one = msg1.y + velocity_y * latency;
+					x_final = x_ * (0.5f) + x_one * (0.5f);
+					y_final = y_ * (0.5f) + y_one * (0.5f);
+					std::cout << "gameTimer " << gameTimer << " - msg1.time " << msg1.time << " = " << latency << "ms" << std::endl;
+					player->setPosition(x_final, y_final); // the interpolated value between two points
+				}
+				else {
+					//player->setPosition(clientXPosition, clientYPosition);
+				}
+				// end of prediction handling
+
 				if (bulletShot) {
-					 // - might not need this
+					// - might not need this
 					// if not already received
-					 // once bullet spawned, should be taken care of both sides
+					// once bullet spawned, should be taken care of both sides
 					//
 					if (!bulletPtr->isAlive()) {
 						bulletPtr->spawn(bulletShot);
@@ -572,15 +686,33 @@ void runUdpClient(unsigned short port) { // receive data from server
 						bulletPtr->kill();
 				}
 
-				// Dealing with enemy / bullet collision
+				// Dealing with enemy / bullet collision && enemy already dead
 				if (enemyShotIDReceived != -1) {
 					for (std::vector<Enemy>::iterator i = enemyList->begin(); i != enemyList->end(); ++i) {
-						if (i->getID() == enemyShotIDReceived && i->isAlive()) {
+						if ((i->getID() == enemyShotIDReceived && i->isAlive())) {
 							i->kill();
 							enemyShotIDReceived = -1; // reset
 						}
 					}
 				}
+				
+				// Dealing with enemy already dead when connecting
+				//if (!enemyCheckOnConnected){
+					//std::cout << "Size of received - " << enemyStatusReceived.size() << std::endl;
+					//std::cout << "Content received - " << enemyStatusReceived << std::endl;
+					//std::cout << "Content in char - " << enemyStatusReceived.c_str() << std::endl;
+					char enemyIds[10]; // this has been optimised from server side, we are now receiving one whole number which is not larger than 10 chars (should be no. of enemy size)
+					strcpy_s(enemyIds, enemyStatusReceived.c_str());
+					for (std::vector<Enemy>::iterator i = enemyList->begin(); i != enemyList->end(); ++i) {
+						for (int j = 0; j < sizeof(enemyIds); j++) {
+							if ((i->getID() == (enemyIds[j] - '0')) && i->isAlive() && (enemyIds[j] - '0' >= 0 && enemyIds[j] - '0' <= 8)) { // compare to actual number by subtracting ASCII values from 0 (48), advantage all in order
+								//std::cout << "This happened " + j << std::endl;
+								i->kill();
+							}
+						}
+					}
+					//enemyCheckOnConnected = true; // check once to sync, don't check again
+				//}
 				
 				// Dealing with enemy position
 				for (std::vector<Enemy>::iterator i = enemyList->begin(); i != enemyList->end(); ++i) {
@@ -593,8 +725,14 @@ void runUdpClient(unsigned short port) { // receive data from server
 					}
 				}
 
+				// Dealing with player death
+				if (!playerAlive) {
+					//throw std::invalid_argument("Game should end, player status is " + playerAlive);
+					gameOver = true;
+					mPlayerIsAlive = false;
+					winState = false;
+				}
 			}
-			
 			/*
 			if (bulletData >> bulletShot >> clientBulletX >> clientBulletY) {
 				if (bulletShot) {
@@ -604,12 +742,18 @@ void runUdpClient(unsigned short port) { // receive data from server
 					//bulletPtr->draw(window); // client window handled from both client and server what to do if bullet is alive
 				}
 			}*/
-			else {
-				// Handle error / packet loss // else simulate?
-				//std::cout << "Error - failed to read from player data packet!" << std::endl; // this is normal when packet is lost
-				// I think I am getting several packet drops as I am receiving and sending from the same PC same port, localhost
+			else { // if(packetTime > gameTimer)
+				std::cout << "Failed to read last packet! - Not Predicting" << std::endl;
+				//std::cout << "Message Holder size - " << messageHolder.size() << std::endl;
+				
+				
+					//useServerTime = true;
+					// Handle error / packet loss // else simulate?
+					//std::cout << "Error - failed to read from player data packet!" << std::endl; // this is normal when packet is lost
+					// I think I am getting several packet drops as I am receiving and sending from the same PC same port, localhost
+				
 			}
-
+			// else discard if packettime is less than gameTimer, to discard old data
 			// store position update over here
 
 			//unsigned short senderPort;
@@ -627,6 +771,16 @@ void runUdpClient(unsigned short port) { // receive data from server
 	// prediction 
 	// bullet
 
+}
+
+sf::Packet& operator <<(sf::Packet& packet, const PlayerMessage& msg)
+{
+	return packet << msg.time << msg.x << msg.y;
+}
+
+sf::Packet& operator >>(sf::Packet& packet, PlayerMessage& msg)
+{
+	return packet >> msg.time >> msg.x >> msg.y;
 }
 
 /*
